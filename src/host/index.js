@@ -27,12 +27,26 @@
 import { spawn } from "node:child_process";
 import { readFile, writeFile, mkdir, readdir, appendFile } from "node:fs/promises";
 import { join, resolve, isAbsolute } from "node:path";
+import { fileURLToPath } from "node:url";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { buildGraph } from "./graph.js";
 import { BOARD_HTML } from "./board-page.js";
 import { PDEV_POLICY_NAME, PDEV_POLICY_ORDER, PDEV_POLICY_TEXT } from "./policy.js";
+import { CONFIG_KEYS, normalizeConfig, pickKnownFields } from "./config.js";
+import { decideGate } from "./gate-decision.js";
+import { teamKey } from "./team-key.js";
+import {
+  PLUGIN_VERSION,
+  buildConfigView,
+  createEventLog,
+  createPluginApi,
+} from "./plugin-api.js";
 
 export const name = "dsh-parallel-dev";
+
+// 配置 schema 必须从模块再导出：Loader 用 `Config` 生成设置表单。
+// 注意 schema 在 `config-schema.js`（它 import schemastery），不在纯逻辑的 `config.js`。
+export { Config } from "./config-schema.js";
 
 // 硬依赖：工具注册表（钩子与工具都挂在它上面）。
 // webServer 是可选依赖，按 cordis 教程用 ctx.get() 在使用处探测，不 inject。
@@ -59,17 +73,75 @@ const MAX_KEPT_PER_SESSION = 80;
  * 所以从 v0.2 起就订阅 `team/task` 事件，把每次变更的时刻记下来。
  */
 const taskTimeline = new Map(); // taskId -> [{ at, status, revision, subject, owner }]
-const MAX_TIMELINE_PER_TASK = 60;
 
-/** 插件加载期间记录的事实，供 preflight 汇报。 */
+/** 插件加载期间记录的事实，供 preflight / 设置页状态接口汇报。 */
 const boot = {
-  version: "0.1.0",
+  version: PLUGIN_VERSION,
   loadedAt: null,
   gateInstalled: false,
   boardRoute: "not attempted",
+  boardStatus: "skipped", // registered | failed | skipped
   policySection: "not attempted",
+  policyStatus: "skipped", // injected | disabled | skipped | failed
   toolRegistration: [],
+  toolSummaries: [],
 };
+
+/** 插件自身事件（设置页展示；只记插件，不记任务流水）。 */
+const pluginEvents = createEventLog();
+
+/** 记一条插件事件。事件缓冲自身出错也绝不能影响门禁/工具。 */
+function logEvent(level, message) {
+  try {
+    pluginEvents.log(level, message);
+  } catch { /* ignore */ }
+}
+
+/** 工具注册时同时登记 { name, summary }，供设置页「插件提供」列表使用。 */
+function noteTool(name, summary) {
+  boot.toolRegistration.push(name);
+  boot.toolSummaries.push({ name, summary });
+}
+
+/** Loader 传给 apply 的 config（第二参数）；settings 不可用时的兜底层。 */
+let capturedConfig = {};
+
+/**
+ * schemastery 的 volatile 字段经 Loader 解析后是带 `get()` 的引用
+ * （cosmokit Volatile），不是普通值。这里做结构性解包，不 import schemastery。
+ * 保留引用本身而不是只存快照：settings 写入时 Loader 的 volatile-commit 会更新
+ * 同一个引用，所以即便 describe 临时失败，兜底值也还是新的。
+ */
+function unwrapConfigValue(value) {
+  try {
+    if (value && typeof value === "object" && typeof value.get === "function") return value.get();
+  } catch { /* 取不到就当普通值 */ }
+  return value;
+}
+
+function capturedSnapshot() {
+  const out = {};
+  if (!capturedConfig || typeof capturedConfig !== "object") return out;
+  for (const key of CONFIG_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(capturedConfig, key)) continue;
+    out[key] = unwrapConfigValue(capturedConfig[key]);
+  }
+  return out;
+}
+
+/** 配置读取缓存 1000ms（契约 §3.3）。 */
+const PREFS_TTL_MS = 1000;
+let prefsCache = null; // { at, value }
+
+/** settings 服务接线面；服务不可用时保持 null（页面只读）。 */
+let settingsFace = null;
+
+/** systemPrompt 服务接线面；syncPolicy 用它实时增删提示词段。 */
+let systemPromptFace = null;
+let policyDisposer = null;
+
+/** webServer 是否真的接上（status 的 board/skipped 判定用）。 */
+let webServerConnected = false;
 
 /** 平台里代表"团队模式可用"的工具名。少任何一个，团队模式就跑不起来。 */
 const TEAM_TOOLS = [
@@ -85,6 +157,220 @@ const TEAM_TOOLS = [
 
 function textRender(fn) {
   return (_args, value) => [{ type: "text", text: fn(value) }];
+}
+
+// ─────────────────────────────────────────────────────────────
+// 配置：读取 / 视图 / 实时同步（契约 §3.3 / §3.5 / §5.3 / §5.4）
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 本插件在 profile 里的 Loader entry id（契约 §5.2）。
+ *
+ * 运行时动态解析，不硬编码：同一个包可能被挂在不同 id 下（bundle 聚合等）。
+ * 找不到时退回 patch 里的默认 id `parallel-dev`。
+ */
+function ownEntryId(ctx) {
+  let fallback;
+  try {
+    for (const entry of ctx.loader?.entries?.() ?? []) {
+      const id = entry?.options?.id;
+      if (entry?.options?.name !== "dsh-parallel-dev" || typeof id !== "string" || id === "") continue;
+      if (entry.fiber === ctx.fiber) return id;
+      if (entry.disabled !== true && fallback === undefined) fallback = id;
+    }
+  } catch { /* loader 不可用 */ }
+  return fallback ?? "parallel-dev";
+}
+
+/** 保存成功后必须立刻失效缓存；否则门禁会在一秒内继续用旧配置。 */
+function invalidatePrefs() {
+  prefsCache = null;
+}
+
+/**
+ * 读取生效配置（契约 §3.3）：
+ *   CONFIG_DEFAULTS 打底 → loader config → settings.describe 的 value。
+ * 任何一步失败都退回上一层；结果缓存 1000ms。
+ */
+function readPrefs() {
+  const now = Date.now();
+  if (prefsCache && now - prefsCache.at < PREFS_TTL_MS) return prefsCache.value;
+
+  let merged = normalizeConfig(capturedSnapshot());
+  try {
+    if (settingsFace) {
+      const rows = settingsFace.describe();
+      const row = rows.find((item) => item && item.ns === settingsFace.entryId());
+      if (row && row.value && typeof row.value === "object" && !Array.isArray(row.value)) {
+        merged = normalizeConfig({ ...merged, ...pickKnownFields(row.value) });
+      }
+    }
+  } catch { /* 设置服务读失败：退回 captured */ }
+
+  const value = Object.freeze(merged);
+  prefsCache = { at: now, value };
+  return value;
+}
+
+/**
+ * 组装配置视图（契约 §3.5）。`writable` 只在「设置服务可用 + 找得到自有 entry」
+ * 时为 true；否必须给出中文 readonlyReason。
+ */
+function readConfigState(ctx) {
+  const value = readPrefs();
+  const entryId = ownEntryId(ctx);
+  let user = {};
+  let revision = null;
+  let writable = false;
+  let readonlyReason = "当前 profile 的设置服务不可用";
+  let source = "captured";
+
+  if (settingsFace) {
+    try {
+      const row = settingsFace.describe().find((item) => item && item.ns === entryId);
+      if (!row) {
+        readonlyReason = `当前 profile 找不到 ${entryId} 这条配置项`;
+      } else {
+        writable = true;
+        source = "settings";
+        revision = typeof row.revision === "number" ? row.revision : null;
+        if (row.user && typeof row.user === "object" && !Array.isArray(row.user)) {
+          user = pickKnownFields(row.user);
+        }
+      }
+    } catch (err) {
+      readonlyReason = `读取设置失败：${err?.message ?? err}`;
+    }
+  }
+
+  return {
+    prefs: value,
+    view: buildConfigView({
+      value,
+      user,
+      revision,
+      writable,
+      readonlyReason: writable ? null : readonlyReason,
+      source,
+      entryId,
+    }),
+  };
+}
+
+/**
+ * 按当前配置实时增删提示词段（契约 §5.4）。
+ *
+ * 幂等：每次保存后都可以调；只有状态真的需要变化时才碰服务。
+ * 系统提示服务不可用时如实记 skipped（不假装注入成功）。
+ */
+function syncPolicy() {
+  try {
+    const prefs = readPrefs();
+    if (!systemPromptFace) {
+      boot.policyStatus = "skipped";
+      boot.policySection = "跳过：systemPrompt 服务不可用";
+      return;
+    }
+    if (prefs.injectPolicy) {
+      if (!policyDisposer) {
+        const dispose = systemPromptFace.section({
+          name: PDEV_POLICY_NAME,
+          order: PDEV_POLICY_ORDER,
+          text: PDEV_POLICY_TEXT,
+        });
+        policyDisposer = typeof dispose === "function" ? dispose : null;
+        boot.policyStatus = "injected";
+        boot.policySection = `已注入（${PDEV_POLICY_NAME}，order ${PDEV_POLICY_ORDER}）`;
+      }
+      return;
+    }
+    if (policyDisposer) {
+      try { policyDisposer(); } catch { /* 已被释放 */ }
+      policyDisposer = null;
+    }
+    boot.policyStatus = "disabled";
+    boot.policySection = "已关闭（配置 injectPolicy=false）";
+  } catch (err) {
+    boot.policyStatus = "failed";
+    boot.policySection = `FAILED: ${err?.message}`;
+    logEvent("warn", `编排纪律注入失败：${err?.message}`);
+  }
+}
+
+/** 只报服务是否存在，不读任务（契约 §4.2）。 */
+function probeServices(ctx) {
+  const has = (name) => {
+    try { return ctx.get(name) !== undefined; } catch { return false; }
+  };
+  return {
+    tools: has("tools"),
+    webServer: has("webServer"),
+    settings: has("settings"),
+    systemPrompt: has("systemPrompt"),
+    agentTeams: has("agentTeams"),
+  };
+}
+
+/** 状态页的安装信息（契约 §5.9）；任何一项拿不到都填 null。 */
+function statusPaths(ctx) {
+  let packageDir = null;
+  try {
+    packageDir = fileURLToPath(new URL("../../", import.meta.url)).replace(/[/\\]+$/, "");
+  } catch { packageDir = null; }
+
+  const profileDir = typeof process.env.DSH_PROFILE_DIR === "string" && process.env.DSH_PROFILE_DIR
+    ? process.env.DSH_PROFILE_DIR
+    : null;
+  const patchFile = profileDir ? join(profileDir, "cordis.patch.yml") : null;
+
+  let dataDir = null;
+  try {
+    const directory = ctx.get("workingDirectory")?.defaultDirectory;
+    if (typeof directory === "string" && directory) dataDir = join(directory, ".pdev");
+  } catch { dataDir = null; }
+
+  return { packageDir, profileDir, patchFile, dataDir };
+}
+
+function pluginError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+/**
+ * 写配置（契约 §3.4）：只走 settings.update，绝不直接写 cordis.patch.yml。
+ * 成功后按契约顺序：失效缓存 → 重新同步提示词段 → 由调用方记 info 事件/返回 view。
+ */
+async function updateConfig(ctx, patch, expectedRevision) {
+  if (!settingsFace) {
+    throw pluginError("settings-unavailable", "当前 profile 的设置服务不可用，无法保存配置。");
+  }
+  const entryId = ownEntryId(ctx);
+  let row = null;
+  try {
+    row = settingsFace.describe().find((item) => item && item.ns === entryId) ?? null;
+  } catch { row = null; }
+  if (!row) {
+    throw pluginError("settings-unavailable", `当前 profile 找不到 ${entryId} 这条配置项，无法保存配置。`);
+  }
+
+  await settingsFace.update(patch, expectedRevision);
+  invalidatePrefs();
+  syncPolicy();
+  return readConfigState(ctx).view;
+}
+
+/** loader 落定后再判定可选服务是否真的缺席（避免把「还没到」误报成「不可用」）。 */
+function afterLoaderSettled(ctx, fn) {
+  try {
+    const awaiting = ctx?.loader?.await?.();
+    if (awaiting && typeof awaiting.then === "function") {
+      Promise.resolve(awaiting).then(fn).catch(() => fn());
+      return;
+    }
+  } catch { /* 退回宏任务 */ }
+  setTimeout(fn, 0);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -149,18 +435,10 @@ function verifyDir(projectRoot) {
  * 只按 task_id 命名的话，上一轮会话给 `task-1` 写的记录，会把这一轮**另一个** task-1
  * 放行 —— 门禁看起来在工作，实际放过的是一份毫不相干的旧记录。
  *
- * 团队身份取「成员列表里的 Lead id」：实施方与验收方看到的是同一份成员列表，
- * 所以两边算出来的 key 一致；单 Agent（无团队）时退回自己的会话 id。
+ * v0.3 起实现移到纯模块 `team-key.js`（契约 §5.11）：一次性验收 subagent 不是团队
+ * 成员时，旧逻辑会退回它自己的 session id，与 Lead 的命名空间对不上；现在按「所属
+ * 根会话自己会算出的 key」归属。详见该文件的注释。
  */
-function teamKey(ctx, exec) {
-  try {
-    const teams = ctx.get("agentTeams");
-    const members = teams?.listMembers?.(exec?.agent) ?? [];
-    const lead = members.find((m) => m?.target === "lead" || m?.name === "lead");
-    if (lead?.id) return `team-${lead.id}`;
-  } catch { /* 退回会话 id */ }
-  return `session-${exec?.agent?.session?.id ?? "unknown"}`;
-}
 
 function verifyPath(projectRoot, key, taskId) {
   return join(verifyDir(projectRoot), `${key}__${taskId}.json`);
@@ -370,7 +648,11 @@ async function appendTimeline(root, entry) {
   try {
     await mkdir(pdevDir(root), { recursive: true });
     await appendFile(timelinePath(root), JSON.stringify(entry) + "\n", "utf8");
-  } catch (e) { console.error(`[dsh-parallel-dev] 时间线落盘失败（时间轴会缺这段历史）: ${e?.message}`); }
+  } catch (e) {
+    console.error(`[dsh-parallel-dev] 时间线落盘失败（时间轴会缺这段历史）: ${e?.message}`);
+    // 契约 §5.5：落盘失败记 warn 插件事件（原有 console 保留）。
+    logEvent("warn", `时间线落盘失败（时间轴会缺这段历史）：${e?.message}`);
+  }
 }
 
 function timelinePath(root) {
@@ -646,8 +928,38 @@ async function collectPreflight(ctx, exec, explicitRoot) {
 // ─────────────────────────────────────────────────────────────
 
 /**
+ * 按决策码补上「怎么修」的说明。决策本身在纯函数里（`gate-decision.js`），
+ * 这里只负责把 v0.2 里最有用的操作指引保留下来。
+ */
+function gateAdvice(code, taskId) {
+  switch (code) {
+    case "no_record":
+      return (
+        `\n\n平台会允许这次调用，但那样「完成」只是一个声称 —— 没有人独立核对过交付物。\n` +
+        `正确做法：派一个**一次性验收代理**（subagent，不用实施方自己）独立核对，然后调用\n` +
+        `  pdev_verify_record(task_id="${taskId}", commit_sha=<被验的提交>, worktree=<代码所在目录>, ` +
+        `verdict="passed", criteria=[...], evidence=[...])\n` +
+        `记录写入后，本动作会被放行。\n\n` +
+        `【用户豁免】如果用户已明确表示这个任务不需要验收，用 pdev_waive 登记豁免；\n` +
+        `它会去会话记录里核对用户原话 —— 你引用的必须是用户真的说过的话。`
+      );
+    case "not_passed":
+      return "\n\n请先整改，整改后重新验收并更新记录。";
+    case "head_unreadable":
+      return "\n\n请检查该目录是否还在，或重新验收一份带有效 worktree 的记录。";
+    case "sha_drift":
+      return "\n\n请对新版本重新验收，或把代码回退到被验收的提交。";
+    default:
+      return "";
+  }
+}
+
+/**
  * 判断一次 `team_task_update` 调用是否应该被拒绝。
- * 返回 null 表示放行；返回字符串表示拒绝理由。
+ * 返回 null 表示放行；返回字符串表示拒绝理由（enforce 模式）。
+ *
+ * v0.3：决策逻辑抽到纯函数 `decideGate()`；这里只做 IO（读豁免/验收记录/HEAD）
+ * 和模式落地（enforce 拒绝 / advise 只提醒）。
  */
 async function gateReason(ctx, exec) {
   const args = exec?.arguments ?? {};
@@ -656,72 +968,63 @@ async function gateReason(ctx, exec) {
   const taskId = args.task_id;
   if (!taskId) return null;
 
+  const prefs = readPrefs();
   const root = sessionCwd(exec);
-  if (!root) {
-    return (
-      "无法校验验收记录：拿不到会话工作目录（session.header.cwd 为空）。" +
-      "本插件要求完成任务前必须有独立验收记录，请检查会话创建时的 cwd。"
-    );
+  const key = teamKey(ctx, exec);
+
+  // 豁免优先：用户亲自指示豁免的任务，直接放行（但留痕，事后可审计）。
+  // 没有项目根时什么记录都读不到，交给 decideGate 按 no_record 处理。
+  let waiver = null;
+  let record = null;
+  let head = null;
+  if (root) {
+    waiver = await readWaiver(root, key, taskId);
+    if (!waiver?.waived) {
+      record = await readVerifyRecord(root, key, taskId);
+      // 只有配置要求时才跑 git —— 关掉 requireCommitMatch 后这一步必须省掉。
+      if (record?.worktree && prefs.requireCommitMatch) {
+        head = await gitHead(record.worktree);
+      }
+    }
   }
 
-  const key = teamKey(ctx, exec);
-  // 豁免优先：用户亲自指示豁免的任务，直接放行（但留痕，事后可审计）
-  const waiver = await readWaiver(root, key, taskId);
-  if (waiver?.waived) {
-    console.log(`[dsh-parallel-dev] 放行 ${taskId}（用户豁免：${waiver.user_quote?.slice(0, 60)}）`);
+  const decision = decideGate(prefs, { waiver, record, head, taskId });
+
+  if (decision.action === "allow") {
+    if (decision.code === "waiver") {
+      console.log(`[dsh-parallel-dev] 放行 ${taskId}（用户豁免：${waiver?.user_quote?.slice(0, 60) ?? ""}）`);
+    }
     return null;
   }
 
-  const rec = await readVerifyRecord(root, key, taskId);
-  if (!rec) {
-    return (
-      `任务 ${taskId} 没有验收记录，不能标记为完成。\n\n` +
-      `平台会允许这次调用，但那样「完成」只是一个声称 —— 没有人独立核对过交付物。\n` +
-      `正确做法：派一个**一次性验收代理**（subagent，不用实施方自己）独立核对，然后调用\n` +
-      `  pdev_verify_record(task_id="${taskId}", commit_sha=<被验的提交>, worktree=<代码所在目录>, ` +
-      `verdict="passed", criteria=[...], evidence=[...])\n` +
-      `记录写入后，本动作会被放行。\n\n` +
-      `【用户豁免】如果用户已明确表示这个任务不需要验收，用 pdev_waive 登记豁免；\n` +
-      `它会去会话记录里核对用户原话 —— 你引用的必须是用户真的说过的话。`
-    );
+  if (decision.action === "advise") {
+    // 契约 §5.6 / §5.8：仅提醒、不拒绝；**不写插件事件**（那是任务流水，页面不展示）。
+    console.log(`[dsh-parallel-dev] 仅提醒：${taskId} ${decision.code}`);
+    return null;
   }
 
-  if (rec.verdict !== "passed") {
-    return (
-      `任务 ${taskId} 的验收结论是 "${rec.verdict}"（${rec.verifier_id ?? "未知验收方"} 于 ${rec.at}），不是 passed，不能标记为完成。\n` +
-      `请先整改，整改后重新验收并更新记录。`
-    );
+  // enforce：保留 v0.2 的拒绝文案，并说明当前处于拦截模式。
+  let message = decision.reason ?? `任务 ${taskId}：验收门禁未通过。`;
+  if (!root) {
+    message +=
+      "\n\n无法校验验收记录：拿不到会话工作目录（session.header.cwd 为空）。" +
+      "本插件要求完成任务前必须有独立验收记录，请检查会话创建时的 cwd。";
+  } else {
+    message += gateAdvice(decision.code, taskId);
   }
-
-  // 验收后代码又被改过吗？
-  if (rec.worktree) {
-    const head = await gitHead(rec.worktree);
-    if (head.sha && head.sha !== rec.commit_sha) {
-      return (
-        `任务 ${taskId} 的代码在验收之后又被改过，不能标记为完成。\n` +
-        `  验收记录的提交：${rec.commit_sha}\n` +
-        `  当前 HEAD：    ${head.sha}（${rec.worktree}）\n\n` +
-        `这说明验收过的版本已经不是交付的版本了 —— 这正是「验收通过」最容易失效的方式。\n` +
-        `请对新版本重新验收，或把代码回退到被验收的提交。`
-      );
-    }
-    if (!head.sha) {
-      return (
-        `任务 ${taskId} 的验收记录指向 worktree「${rec.worktree}」，但现在读不到它的 HEAD（${head.reason}）。\n` +
-        `无法确认交付物就是被验收的那一份，因此拒绝。请检查该目录是否还在。`
-      );
-    }
-  }
-
-  return null;
+  message += "\n\n当前为拦截模式：该动作已被拒绝。可在「并行开发配置」里把门禁切到「仅提醒」。";
+  return message;
 }
 
 // ─────────────────────────────────────────────────────────────
 // 插件入口
 // ─────────────────────────────────────────────────────────────
 
-export function apply(ctx) {
+export function apply(ctx, config) {
+  capturedConfig = config && typeof config === "object" && !Array.isArray(config) ? config : {};
+  invalidatePrefs();
   boot.loadedAt = new Date().toISOString();
+  logEvent("info", `插件已加载 v${boot.version}`);
   console.log(`[dsh-parallel-dev] v${boot.version} loaded`);
 
   // ── 门禁：这一条是本插件的核心价值 ──────────────────────────────
@@ -735,38 +1038,90 @@ export function apply(ctx) {
       }
       return next();
     } catch (err) {
-      // 门禁自身出错时不要卡死流程，但要说清楚
+      // 门禁自身出错时不要卡死流程，但要说清楚（事件里不写 task_id）。
       console.log(`[dsh-parallel-dev] gate error: ${err?.message}`);
+      logEvent("error", `门禁自身异常：${err?.message ?? err}`);
       return next();
     }
   });
   boot.gateInstalled = true;
+  logEvent("info", "门禁已安装（拦截「标记完成」动作）");
 
-  // ── 观察用户消息：豁免核对的唯一依据 ────────────────────────────
-  // ── 注入编排纪律：这就是"插件取代技能"的那一步 ──────────────────
+  // ── 注入编排纪律：实时开关（契约 §5.4）────────────────────────
   // 系统提示是"装了就有"的，不依赖用户手动加载技能，也不依赖模型主动选择。
-  // 放在 TEAM_POLICY(600) 之后，紧挨团队政策，语义上连贯。
+  // 放在 TEAM_POLICY(600) 之后，紧挨团队政策，语义上连贯；配置关掉时移除这一段。
   try {
     ctx.inject(["systemPrompt"], (sctx) => {
-      const section = sctx.systemPrompt?.section;
-      if (typeof section !== "function") { boot.policySection = "跳过：systemPrompt.section 不可用"; return; }
-      sctx.systemPrompt.section({
-        name: PDEV_POLICY_NAME,
-        order: PDEV_POLICY_ORDER,
-        text: PDEV_POLICY_TEXT,
-      });
-      boot.policySection = `已注入（${PDEV_POLICY_NAME}，order ${PDEV_POLICY_ORDER}）`;
-      console.log("[dsh-parallel-dev] policy section injected into system prompt");
+      if (systemPromptFace) return; // 每个服务只接一次
+      try {
+        const section = sctx.systemPrompt?.section;
+        if (typeof section !== "function") {
+          boot.policyStatus = "failed";
+          boot.policySection = "跳过：systemPrompt.section 不可用";
+          logEvent("warn", "systemPrompt.section 不可用，跳过编排纪律注入");
+          return;
+        }
+        systemPromptFace = { section: section.bind(sctx.systemPrompt) };
+        syncPolicy();
+        if (boot.policyStatus === "injected") {
+          logEvent("info", "编排纪律已注入系统提示");
+          console.log("[dsh-parallel-dev] policy section injected into system prompt");
+        } else if (boot.policyStatus === "disabled") {
+          logEvent("info", "配置 injectPolicy=false，未注入编排纪律");
+        }
+      } catch (err) {
+        boot.policyStatus = "failed";
+        boot.policySection = `FAILED: ${err?.message}`;
+        logEvent("warn", `编排纪律注入失败：${err?.message}`);
+        console.log(`[dsh-parallel-dev] policy injection failed: ${err?.message}`);
+      }
     });
   } catch (err) {
+    boot.policyStatus = "failed";
     boot.policySection = `FAILED: ${err?.message}`;
-    console.log(`[dsh-parallel-dev] policy injection failed: ${err?.message}`);
+    logEvent("warn", `系统提示服务接线失败：${err?.message}`);
   }
 
-  // ── 观察任务变更：时间轴的唯一数据来源 ──────────────────────────
+  // ── 设置服务：读配置 + 让原生配置页不重复渲染（契约 §5.3）────────
+  // settings.configure({auto:false})：本插件自带设置页，关掉自动生成的原生表单。
+  try {
+    ctx.inject(["settings"], (sctx) => {
+      if (settingsFace) return;
+      try {
+        settingsFace = {
+          entryId: () => ownEntryId(ctx),
+          describe: () => {
+            const rows = sctx.settings?.describe?.({ redactSecrets: true });
+            return Array.isArray(rows) ? rows : [];
+          },
+          update: (patch, expectedRevision) => sctx.settings.update(ownEntryId(ctx), patch, expectedRevision),
+        };
+        try {
+          ctx.effect(
+            () => sctx.settings.configure({ auto: false }, ctx.fiber),
+            "dsh-parallel-dev: settings policy",
+          );
+        } catch (err) {
+          logEvent("warn", `设置页策略注册失败：${err?.message}`);
+        }
+        invalidatePrefs();
+        syncPolicy(); // systemPrompt 若已就绪，这里就会按配置注入
+        logEvent("info", "设置服务已连接，配置页可写");
+      } catch (err) {
+        settingsFace = null;
+        logEvent("warn", `设置服务接线失败：${err?.message}`);
+      }
+    });
+  } catch (err) {
+    logEvent("warn", `设置服务不可用：${err?.message}`);
+  }
+
+  // ── 观察任务变更：时间轴的唯一数据来源（开关与容量来自配置，契约 §5.5）──
   ctx.on("session/event", (session, event) => {
     try {
       if (event?.type !== "team/task") return;
+      const prefs = readPrefs();
+      if (prefs.timelineEnabled === false) return;
       const d = event.data ?? {};
       const task = d.task ?? d;
       const id = task?.id;
@@ -784,7 +1139,7 @@ export function apply(ctx) {
       // 同一 revision 的重复事件不重复记
       if (!last || last.revision !== snapshot.revision || last.status !== snapshot.status) {
         list.push(snapshot);
-        while (list.length > MAX_TIMELINE_PER_TASK) list.shift();
+        while (list.length > prefs.timelineMaxEntries) list.shift();
         taskTimeline.set(id, list);
         // 落盘：跨重启保留历史（内存版一重启就没了）
         void appendTimeline(session?.header?.cwd ?? null, { task_id: id, ...snapshot });
@@ -792,6 +1147,7 @@ export function apply(ctx) {
     } catch { /* 观察失败不影响主流程 */ }
   });
 
+  // ── 观察用户消息：豁免核对的唯一依据 ────────────────────────────
   ctx.on("session/event", (session, event) => {
     try {
       if (event?.type !== "user/message") return;
@@ -816,6 +1172,7 @@ export function apply(ctx) {
     ctx.inject(["webServer"], (sctx) => {
       const webServer = sctx.webServer;
       if (!webServer?.register) return;
+      webServerConnected = true;
       webServer.register({
         kind: "exact",
         path: "/pdev/board",
@@ -845,6 +1202,8 @@ export function apply(ctx) {
             sendJson(res, 200, {
               ...graph,
               timeline,
+              // 契约 §4.4：只在顶层多这一个字段；老客户端读到 undefined 时按 true 处理。
+              prefs: { autoOpen: readPrefs().autoOpen },
               meta: {
                 taskCount: tasks.length,
                 agentId, agentCount,
@@ -863,10 +1222,39 @@ export function apply(ctx) {
         },
       });
       boot.boardRoute = "registered at /pdev/board";
+      boot.boardStatus = "registered";
+      logEvent("info", "看板路由已注册：/pdev/board");
       console.log("[dsh-parallel-dev] board route /pdev/board registered");
+
+      // ── 设置页数据接口（v0.3）：只报插件自身状态 / 写配置 ──────────
+      const pluginApi = createPluginApi({
+        boot,
+        events: pluginEvents,
+        logEvent,
+        sameOriginOk,
+        sendJson,
+        invalidatePrefs,
+        entryId: () => ownEntryId(ctx),
+        tools: () => boot.toolSummaries,
+        services: () => probeServices(ctx),
+        paths: () => statusPaths(ctx),
+        configView: () => readConfigState(ctx).view,
+        updateConfig: (patch, expectedRevision) => updateConfig(ctx, patch, expectedRevision),
+      });
+      try {
+        webServer.register({ kind: "exact", path: "/pdev/plugin/status", handler: pluginApi.handleStatus });
+        webServer.register({ kind: "exact", path: "/pdev/plugin/config", handler: pluginApi.handleConfig });
+        logEvent("info", "设置页数据接口已注册：/pdev/plugin/status、/pdev/plugin/config");
+        console.log("[dsh-parallel-dev] plugin status/config routes registered");
+      } catch (err) {
+        logEvent("error", `设置页数据接口注册失败：${err?.message}`);
+        console.log(`[dsh-parallel-dev] plugin routes failed: ${err?.message}`);
+      }
     });
   } catch (err) {
     boot.boardRoute = `FAILED: ${err?.message}`;
+    boot.boardStatus = "failed";
+    logEvent("warn", `看板路由注册失败：${err?.message}`);
     console.log(`[dsh-parallel-dev] board route failed: ${err?.message}`);
   }
 
@@ -898,7 +1286,7 @@ export function apply(ctx) {
       return { report: JSON.stringify(await collectPreflight(ctx, exec, args?.project_root), null, 2) };
     },
   }));
-  boot.toolRegistration.push("pdev_preflight");
+  noteTool("pdev_preflight", "开工前门禁检查");
 
   // ── 工具 2：pdev_verify_record ─────────────────────────────────
   ctx.tools.register(defineTool({
@@ -958,8 +1346,14 @@ export function apply(ctx) {
       if (!["passed", "needs_fix", "disputed"].includes(verdict)) {
         return { ok: false, message: `verdict 必须是 passed | needs_fix | disputed，收到 "${verdict}"。`, record_path: "(未写入)" };
       }
+
+      // 契约 §5.7：两项严格校验可由配置放宽；放宽时记录留痕，文案说明「已按配置放宽」。
+      const prefs = readPrefs();
+      const relaxEvidence = prefs.requireEvidence === false;
+      const relaxSelfCertification = prefs.blockSelfCertification === false;
+
       const evidence = Array.isArray(args.evidence) ? args.evidence.filter((s) => String(s).trim()) : [];
-      if (evidence.length === 0) {
+      if (evidence.length === 0 && !relaxEvidence) {
         return {
           ok: false,
           message:
@@ -972,8 +1366,9 @@ export function apply(ctx) {
       // ── 自证检查：验收人不能就是任务所有者 ──────────────────────
       // 「实施和验收必须是不同的人」是这套流程的核心。若允许实施方自己登记
       // 验收记录，这里的门禁就退化成了「点两下按钮」，毫无意义。
+      // 配置 blockSelfCertification=false 时跳过，但记录上必须留下放宽痕迹。
       const ownership = await checkSelfCertification(ctx, exec, String(args.task_id));
-      if (ownership.selfCertified) {
+      if (ownership.selfCertified && !relaxSelfCertification) {
         return {
           ok: false,
           message:
@@ -1006,10 +1401,15 @@ export function apply(ctx) {
         // 自证检查的留痕：事后能看出这份记录是谁登记的、当时任务归谁
         verifier_agent_id: exec?.agent?.id ?? null,
         task_owner_at_record: ownership.ownerName ?? null,
-        self_certification_check: { checked: ownership.checked, note: ownership.note },
+        self_certification_check: {
+          checked: ownership.checked,
+          note: relaxSelfCertification ? "用户关闭了自证检查" : ownership.note,
+        },
         at: new Date().toISOString(),
         session_id: exec?.agent?.session?.id ?? null,
       };
+      if (relaxEvidence) record.evidence_waived = true;
+      if (relaxSelfCertification) record.self_certification_waived = true;
 
       const key = teamKey(ctx, exec);
       const dir = verifyDir(root);
@@ -1018,18 +1418,22 @@ export function apply(ctx) {
       record.team_key = key;
       await writeFile(path, JSON.stringify(record, null, 2) + "\n", "utf8");
 
+      const relaxed = [];
+      if (relaxEvidence) relaxed.push("证据要求已按配置放宽");
+      if (relaxSelfCertification) relaxed.push("自证检查已按配置放宽");
       const warn = record.sha_matches_now
         ? ""
         : `\n⚠ 你填的 commit_sha (${record.commit_sha}) 与该 worktree 当前 HEAD (${head.sha}) 不一致。` +
           `记录已按你填的值写入，但完成任务时会以当前 HEAD 复核 —— 不一致会被拒绝。`;
+      const relaxNote = relaxed.length ? `\n（${relaxed.join("；")}）` : "";
       return {
         ok: true,
-        message: `已登记 ${record.task_id} 的验收记录：${verdict}，${evidence.length} 条证据。${warn}`,
+        message: `已登记 ${record.task_id} 的验收记录：${verdict}，${evidence.length} 条证据。${relaxNote}${warn}`,
         record_path: path,
       };
     },
   }));
-  boot.toolRegistration.push("pdev_verify_record");
+  noteTool("pdev_verify_record", "登记独立验收记录");
 
   // ── 工具：pdev_board（看板地址与现状） ───────────────────────────
   ctx.tools.register(defineTool({
@@ -1070,7 +1474,7 @@ export function apply(ctx) {
       return { report: lines.join("\n") };
     },
   }));
-  boot.toolRegistration.push("pdev_board");
+  noteTool("pdev_board", "给出看板地址与依赖图摘要");
 
   // ── 工具 3：pdev_waive（用户亲自指示时的豁免通道） ───────────────
   ctx.tools.register(defineTool({
@@ -1180,7 +1584,7 @@ export function apply(ctx) {
       };
     },
   }));
-  boot.toolRegistration.push("pdev_waive");
+  noteTool("pdev_waive", "登记用户豁免");
 
   // ── 工具 3：pdev_gate_status（只读，便于自查为什么被拒） ─────────
   ctx.tools.register(defineTool({
@@ -1213,6 +1617,7 @@ export function apply(ctx) {
         policySection: boot.policySection,
         boardRoute: boot.boardRoute,
         tools: boot.toolRegistration,
+        config: readPrefs(),
         projectRoot: root,
         projectRootSource: source,
         interceptedTool: "team_task_update（action=complete）",
@@ -1233,7 +1638,26 @@ export function apply(ctx) {
       return { report: JSON.stringify(out, null, 2) };
     },
   }));
-  boot.toolRegistration.push("pdev_gate_status");
+  noteTool("pdev_gate_status", "查看门禁与验收记录");
+
+  // ── loader 落定后：如实标记缺席的可选服务（status / 事件）──────────
+  afterLoaderSettled(ctx, () => {
+    try {
+      if (!settingsFace) {
+        logEvent("warn", "设置服务不可用：配置页只读，修改请编辑 profile 的 cordis.patch.yml");
+      }
+      if (!webServerConnected) {
+        boot.boardStatus = "skipped";
+        boot.boardRoute = "skipped: webServer 服务不可用";
+        logEvent("warn", "webServer 服务不可用：看板与设置页数据接口跳过");
+      }
+      if (!systemPromptFace && boot.policyStatus !== "failed") {
+        boot.policyStatus = "skipped";
+        boot.policySection = "跳过：systemPrompt 服务不可用";
+        logEvent("warn", "系统提示服务不可用：跳过编排纪律注入");
+      }
+    } catch { /* 状态自检失败不影响主流程 */ }
+  });
 
   console.log(`[dsh-parallel-dev] gate on tools/pre-execute installed; tools: ${boot.toolRegistration.join(", ")}`);
 }
