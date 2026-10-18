@@ -1,0 +1,6 @@
+# 开发期挂载叠加层：把插件插进 profile。
+# 用法：dsh --profile pdevdev --patch <此文件> "<prompt>"
+# 前置：先跑 ./dev-sync.sh 把包同步进 profile 的 node_modules。
+- insert:
+    - id: parallel-dev
+      name: 'dsh-parallel-dev'

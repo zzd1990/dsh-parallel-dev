@@ -1,0 +1,28 @@
+{
+  "name": "dsh-parallel-dev",
+  "version": "0.0.1",
+  "private": true,
+  "description": "DSH 并行开发编排插件：让「智能体团队模式并行开发」从建议变成有门禁、可校验的机制。",
+  "type": "module",
+  "main": "src/host/index.js",
+  "exports": {
+    ".": "./src/host/index.js",
+    "./client": "./src/client/client.js",
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ],
+      "platform": "web"
+    }
+  }
+}

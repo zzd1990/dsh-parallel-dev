@@ -1,0 +1,6 @@
+node_modules/
+*.tgz
+
+# 运行时数据（验收记录 / 时间线）
+.pdev/
+.DS_Store
